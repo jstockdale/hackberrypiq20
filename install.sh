@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PKG_NAME="hackberrypi-max17048"
-PKG_VER="$(cat "${SCRIPT_DIR}/VERSION")"
+PKG_VER="$(tr -d ' \t\r\n' < "${SCRIPT_DIR}/VERSION")"
 DT_NAME="hackberrypicm5"
 
 CONFIG_TXT="/boot/firmware/config.txt"
@@ -29,8 +29,12 @@ exec_cmd() {
   printf '%q ' "${cmd[@]}"
   printf '\n'
 
+  # Because we're running with "set -e", a failing command would exit the script
+  # before we can capture status and print a nice error. Temporarily disable -e.
+  set +e
   "${cmd[@]}"
   local status=$?
+  set -e
 
   if [[ $status -eq 0 ]]; then
     log "[✓] Success"
@@ -60,12 +64,12 @@ check_prereqs() {
   [[ -f "${CONFIG_TXT}" ]] || die "Missing ${CONFIG_TXT}"
   [[ -d "${OVERLAY_DIR}" ]] || die "Missing ${OVERLAY_DIR}"
 
-  for cmd in dkms make dtc rsync; do
+  for cmd in dkms make dtc rsync install sed grep uname; do
     command -v "${cmd}" >/dev/null 2>&1 || die "Missing dependency: ${cmd}"
   done
 
-  [[ -d "/lib/modules/$(uname -r)/build" ]] || \
-    die "Kernel headers missing: sudo apt install linux-headers-$(uname -r)"
+  [[ -d "/lib/modules/$(uname -r)/build" ]] || die \
+    "Kernel headers missing for $(uname -r). Install headers for your kernel (e.g. linux-headers-$(uname -r) or linux-headers-rpi-2712 on Pi)."
 }
 
 sync_sources() {
@@ -81,14 +85,15 @@ sync_sources() {
 }
 
 dkms_install() {
-  section "DKMS add / build / install"
+  section "DKMS remove / add / build / install"
 
+  # Ensure reruns reliably refresh the DKMS state for this version.
   if dkms status -m "${PKG_NAME}" -v "${PKG_VER}" >/dev/null 2>&1; then
-    log "DKMS entry already exists"
-  else
-    must_exec dkms add -m "${PKG_NAME}" -v "${PKG_VER}"
+    log "Existing DKMS entry found for ${PKG_NAME}/${PKG_VER}, removing to refresh"
+    exec_cmd dkms remove -m "${PKG_NAME}" -v "${PKG_VER}" --all || true
   fi
 
+  must_exec dkms add     -m "${PKG_NAME}" -v "${PKG_VER}"
   must_exec dkms build   -m "${PKG_NAME}" -v "${PKG_VER}"
   must_exec dkms install -m "${PKG_NAME}" -v "${PKG_VER}"
 }
@@ -96,18 +101,25 @@ dkms_install() {
 install_overlay() {
   section "Install device-tree overlay"
 
+  local dtbo_tmp="/tmp/${DT_NAME}.dtbo"
+
   must_exec dtc -I dts -O dtb \
-    -o "${SCRIPT_DIR}/${DT_NAME}.dtbo" \
+    -o "${dtbo_tmp}" \
        "${SCRIPT_DIR}/${DT_NAME}.dts"
 
   must_exec install -m 0644 \
-    "${SCRIPT_DIR}/${DT_NAME}.dtbo" \
+    "${dtbo_tmp}" \
     "${OVERLAY_DIR}/${DT_NAME}.dtbo"
 
-  must_exec sed -i "\|^dtoverlay=${DT_NAME}$|d" "${CONFIG_TXT}"
-  echo "dtoverlay=${DT_NAME}" >> "${CONFIG_TXT}"
+  # Enable overlay if not already enabled (avoid duplicate lines)
+  if grep -qx "dtoverlay=${DT_NAME}" "${CONFIG_TXT}"; then
+    log "Overlay already enabled in config.txt"
+  else
+    echo "dtoverlay=${DT_NAME}" >> "${CONFIG_TXT}"
+    log "Overlay enabled in config.txt"
+  fi
 
-  log "Overlay installed and enabled"
+  log "Overlay installed"
 }
 
 print_status() {
@@ -119,7 +131,7 @@ print_status() {
   done
 
   log "Overlay present: $(test -f "${OVERLAY_DIR}/${DT_NAME}.dtbo" && echo yes || echo no)"
-  log "Overlay enabled: $(grep -q "^dtoverlay=${DT_NAME}$" "${CONFIG_TXT}" && echo yes || echo no)"
+  log "Overlay enabled: $(grep -qx "dtoverlay=${DT_NAME}" "${CONFIG_TXT}" && echo yes || echo no)"
 }
 
 main() {

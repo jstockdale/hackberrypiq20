@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PKG_NAME="hackberrypi-max17048"
-PKG_VER="$(cat "${SCRIPT_DIR}/VERSION")"
+PKG_VER="$(tr -d ' \t\r\n' < "${SCRIPT_DIR}/VERSION")"
 DT_NAME="hackberrypicm5"
 
 CONFIG_TXT="/boot/firmware/config.txt"
@@ -29,8 +29,11 @@ exec_cmd() {
   printf '%q ' "${cmd[@]}"
   printf '\n'
 
+  # Allow us to capture status even under `set -e`
+  set +e
   "${cmd[@]}"
   local status=$?
+  set -e
 
   if [[ $status -eq 0 ]]; then
     log "[✓] Success"
@@ -56,8 +59,14 @@ section() {
 remove_overlay() {
   section "Remove device-tree overlay"
 
-  must_exec sed -i "\|^dtoverlay=${DT_NAME}$|d" "${CONFIG_TXT}"
-  rm -f "${OVERLAY_DIR}/${DT_NAME}.dtbo" || true
+  if [[ -f "${CONFIG_TXT}" ]]; then
+    # Remove any exact matching overlay lines
+    exec_cmd sed -i "\|^dtoverlay=${DT_NAME}$|d" "${CONFIG_TXT}" || true
+  else
+    warn "Missing ${CONFIG_TXT} (skipping)"
+  fi
+
+  exec_cmd rm -f "${OVERLAY_DIR}/${DT_NAME}.dtbo" || true
 
   log "Overlay removed"
 }
@@ -68,14 +77,14 @@ remove_dkms() {
   if dkms status -m "${PKG_NAME}" -v "${PKG_VER}" >/dev/null 2>&1; then
     must_exec dkms remove -m "${PKG_NAME}" -v "${PKG_VER}" --all
   else
-    log "No DKMS entry found"
+    log "No DKMS entry found for ${PKG_NAME}/${PKG_VER}"
   fi
 }
 
 remove_sources() {
   section "Remove DKMS sources"
 
-  rm -rf "${DKMS_SRC_DIR}" || true
+  exec_cmd rm -rf "${DKMS_SRC_DIR}" || true
 }
 
 print_status() {
@@ -87,6 +96,7 @@ print_status() {
   done || true
 
   log "Overlay present: $(test -f "${OVERLAY_DIR}/${DT_NAME}.dtbo" && echo yes || echo no)"
+  log "Overlay enabled: $(test -f "${CONFIG_TXT}" && grep -qx "dtoverlay=${DT_NAME}" "${CONFIG_TXT}" && echo yes || echo no)"
 }
 
 main() {
