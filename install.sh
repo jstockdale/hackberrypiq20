@@ -29,8 +29,8 @@ exec_cmd() {
   printf '%q ' "${cmd[@]}"
   printf '\n'
 
-  # Because we're running with "set -e", a failing command would exit the script
-  # before we can capture status and print a nice error. Temporarily disable -e.
+  # Under `set -e`, a failing command would exit immediately.
+  # Temporarily disable -e so we can capture status + print a nice message.
   set +e
   "${cmd[@]}"
   local status=$?
@@ -72,6 +72,30 @@ check_prereqs() {
     "Kernel headers missing for $(uname -r). Install headers for your kernel (e.g. linux-headers-$(uname -r) or linux-headers-rpi-2712 on Pi)."
 }
 
+cleanup_old_versions() {
+  section "Cleanup old DKMS entries / source trees"
+
+  # Remove any DKMS entries for this module (all versions). This keeps upgrades clean.
+  if dkms status -m "${PKG_NAME}" >/dev/null 2>&1; then
+    log "Removing existing DKMS entries for ${PKG_NAME} (all versions)"
+    exec_cmd dkms remove -m "${PKG_NAME}" --all || true
+  else
+    log "No existing DKMS entries for ${PKG_NAME}"
+  fi
+
+  # Remove old /usr/src trees for this package, but keep the one we'll install (we'll recreate it anyway).
+  shopt -s nullglob
+  local trees=(/usr/src/"${PKG_NAME}"-*)
+  shopt -u nullglob
+
+  if [[ ${#trees[@]} -gt 0 ]]; then
+    for t in "${trees[@]}"; do
+      # We’re going to recreate ${DKMS_SRC_DIR} via rsync; remove anything stale.
+      exec_cmd rm -rf "${t}" || true
+    done
+  fi
+}
+
 sync_sources() {
   section "Sync DKMS source tree"
   must_exec mkdir -p "${DKMS_SRC_DIR}"
@@ -85,13 +109,7 @@ sync_sources() {
 }
 
 dkms_install() {
-  section "DKMS remove / add / build / install"
-
-  # Ensure reruns reliably refresh the DKMS state for this version.
-  if dkms status -m "${PKG_NAME}" -v "${PKG_VER}" >/dev/null 2>&1; then
-    log "Existing DKMS entry found for ${PKG_NAME}/${PKG_VER}, removing to refresh"
-    exec_cmd dkms remove -m "${PKG_NAME}" -v "${PKG_VER}" --all || true
-  fi
+  section "DKMS add / build / install"
 
   must_exec dkms add     -m "${PKG_NAME}" -v "${PKG_VER}"
   must_exec dkms build   -m "${PKG_NAME}" -v "${PKG_VER}"
@@ -111,7 +129,6 @@ install_overlay() {
     "${dtbo_tmp}" \
     "${OVERLAY_DIR}/${DT_NAME}.dtbo"
 
-  # Enable overlay if not already enabled (avoid duplicate lines)
   if grep -qx "dtoverlay=${DT_NAME}" "${CONFIG_TXT}"; then
     log "Overlay already enabled in config.txt"
   else
@@ -128,7 +145,7 @@ print_status() {
   log "DKMS status:"
   dkms status | while IFS= read -r line; do
     log "  ${line}"
-  done
+  done || true
 
   log "Overlay present: $(test -f "${OVERLAY_DIR}/${DT_NAME}.dtbo" && echo yes || echo no)"
   log "Overlay enabled: $(grep -qx "dtoverlay=${DT_NAME}" "${CONFIG_TXT}" && echo yes || echo no)"
@@ -137,6 +154,7 @@ print_status() {
 main() {
   need_root
   check_prereqs
+  cleanup_old_versions
   sync_sources
   dkms_install
   install_overlay
